@@ -9,19 +9,18 @@
 import Foundation
 
 public enum EventSourceState {
+    case idle
     case connecting
     case open
     case closed
 }
 
 public protocol EventSourceProtocol {
-    var headers: [String: String] { get }
-
     /// RetryTime: This can be changed remotly if the server sends an event `retry:`
     var retryTime: Int { get }
 
     /// URL where EventSource will listen for events.
-    var url: URL { get }
+    var request: URLRequest { get }
 
     /// The last event id received from server. This id is neccesary to keep track of the last event-id received to avoid
     /// receiving duplicate events after a reconnection.
@@ -75,17 +74,20 @@ public protocol EventSourceProtocol {
 
 open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
     static let DefaultRetryTime = 3000
+    static let UPDATE_EVENT = "update"
+    static let END_STREAMING = "<END_STREAMING_SSE>"
 
-    public let urlRequest: URLRequest
-    public var url: URL { urlRequest.url! }
+    public let request: URLRequest
     private(set) public var lastEventId: String?
+    private(set) public var lastRawData: Data?
     private(set) public var retryTime = EventSource.DefaultRetryTime
-    private(set) public var headers: [String: String]
     private(set) public var readyState: EventSourceState
 
     private var onOpenCallback: (() -> Void)?
     private var onComplete: ((Int?, Bool?, NSError?) -> Void)?
+    private var onInterrupted: (() -> Void)?
     private var onMessageCallback: ((_ id: String?, _ event: String?, _ data: String?) -> Void)?
+    private var onRawDataCallback: ((_ data: Data) -> Void)?
     private var eventListeners: [String: (_ id: String?, _ event: String?, _ data: String?) -> Void] = [:]
 
     private var eventStreamParser: EventStreamParser?
@@ -93,13 +95,10 @@ open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
     private var mainQueue = DispatchQueue.main
     private var urlSession: URLSession?
 
-    public init(
-        urlRequest: URLRequest
-    ) {
-        self.urlRequest = urlRequest
-        self.headers = urlRequest.allHTTPHeaderFields ?? [:]
+    public init(request: URLRequest) {
+        self.request = request
 
-        readyState = EventSourceState.closed
+        readyState = EventSourceState.idle
         operationQueue = OperationQueue()
         operationQueue.maxConcurrentOperationCount = 1
 
@@ -112,16 +111,26 @@ open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
 
         let configuration = sessionConfiguration(lastEventId: lastEventId)
         urlSession = URLSession(configuration: configuration, delegate: self, delegateQueue: operationQueue)
-        urlSession?.dataTask(with: urlRequest).resume()
+        urlSession?.dataTask(with: request).resume()
     }
 
     public func disconnect() {
+        if case .open = readyState {
+            onComplete?(200, nil, nil)
+        }
+        
+        onInterrupted?()
         readyState = .closed
         urlSession?.invalidateAndCancel()
+        onComplete = nil
     }
-
+    
     public func onOpen(_ onOpenCallback: @escaping (() -> Void)) {
         self.onOpenCallback = onOpenCallback
+    }
+    
+    public func onInterrupted(_ onInterrupted: @escaping (() -> Void)) {
+        self.onInterrupted = onInterrupted
     }
 
     public func onComplete(_ onComplete: @escaping ((Int?, Bool?, NSError?) -> Void)) {
@@ -130,6 +139,10 @@ open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
 
     public func onMessage(_ onMessageCallback: @escaping ((_ id: String?, _ event: String?, _ data: String?) -> Void)) {
         self.onMessageCallback = onMessageCallback
+    }
+    
+    public func onRawData(_ onRawDataCallback: @escaping (_ data: Data) -> Void) {
+        self.onRawDataCallback = onRawDataCallback
     }
 
     public func addEventListener(_ event: String,
@@ -144,15 +157,17 @@ open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
     public func events() -> [String] {
         return Array(eventListeners.keys)
     }
-
+    
     open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
 
         if readyState != .open {
             return
         }
 
-        if let events = eventStreamParser?.append(data: data) {
+        if let events = eventStreamParser?.append(data: data), events.isEmpty == false {
             notifyReceivedEvents(events)
+        } else {
+            notifyReceivedRawData(data)
         }
     }
 
@@ -172,12 +187,18 @@ open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
                          didCompleteWithError error: Error?) {
 
         guard let responseStatusCode = (task.response as? HTTPURLResponse)?.statusCode else {
-            mainQueue.async { [weak self] in self?.onComplete?(nil, nil, error as NSError?) }
+            mainQueue.async { [weak self] in
+                self?.onComplete?(nil, nil, error as NSError?)
+                self?.readyState = .idle
+            }
             return
         }
 
         let reconnect = shouldReconnect(statusCode: responseStatusCode)
-        mainQueue.async { [weak self] in self?.onComplete?(responseStatusCode, reconnect, nil) }
+        mainQueue.async { [weak self] in
+            self?.onComplete?(responseStatusCode, reconnect, nil)
+            self?.readyState = .idle
+        }
     }
 
     open func urlSession(_ session: URLSession,
@@ -187,16 +208,16 @@ open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
                          completionHandler: @escaping (URLRequest?) -> Void) {
 
         var newRequest = request
-        self.headers.forEach { newRequest.setValue($1, forHTTPHeaderField: $0) }
+        // self.headers.forEach { newRequest.setValue($1, forHTTPHeaderField: $0) }
         completionHandler(newRequest)
     }
+
 }
 
 internal extension EventSource {
-
     func sessionConfiguration(lastEventId: String?) -> URLSessionConfiguration {
 
-        var additionalHeaders = headers
+        var additionalHeaders = request.allHTTPHeaderFields ?? [:]
         if let eventID = lastEventId {
             additionalHeaders["Last-Event-Id"] = eventID
         }
@@ -222,6 +243,7 @@ private extension EventSource {
     func notifyReceivedEvents(_ events: [Event]) {
 
         for event in events {
+            lastRawData = nil
             lastEventId = event.id
             retryTime = event.retryTime ?? EventSource.DefaultRetryTime
 
@@ -237,6 +259,11 @@ private extension EventSource {
                 mainQueue.async { eventHandler(event.id, event.event, event.data) }
             }
         }
+    }
+    
+    func notifyReceivedRawData(_ rawData: Data) {
+        lastRawData = rawData
+        mainQueue.async { [weak self] in self?.onRawDataCallback?(rawData) }
     }
 
     // Following "5 Processing model" from:
