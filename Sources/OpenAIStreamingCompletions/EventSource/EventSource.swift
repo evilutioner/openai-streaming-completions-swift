@@ -99,8 +99,8 @@ open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
     private var mainQueue = DispatchQueue.main
     private var urlSession: URLSession?
 
-    public init(request: URLRequest) {
-        self.request = request
+    public init(urlRequest: URLRequest) {
+        self.request = urlRequest
 
         readyState = EventSourceState.idle
         operationQueue = OperationQueue()
