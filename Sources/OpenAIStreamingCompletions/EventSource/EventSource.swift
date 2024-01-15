@@ -70,12 +70,16 @@ public protocol EventSourceProtocol {
     ///
     /// - Parameter event: name of the listener to be remove from event source.
     func removeEventListener(_ event: String)
+    
+    func onInterrupted(_ onInterrupted: @escaping (() -> Void))
+    
+    var lastRawData: Data? { get }
 }
 
 open class EventSource: NSObject, EventSourceProtocol, URLSessionDataDelegate {
     static let DefaultRetryTime = 3000
-    static let UPDATE_EVENT = "update"
-    static let END_STREAMING = "<END_STREAMING_SSE>"
+    public static let UPDATE_EVENT = "update"
+    public static let END_STREAMING = "<END_STREAMING_SSE>"
 
     public let request: URLRequest
     private(set) public var lastEventId: String?
